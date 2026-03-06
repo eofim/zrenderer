@@ -19,6 +19,7 @@ import zrenderer.server.dto : RenderRequestData, RenderResponseData, toString;
 import zrenderer.server.globals : defaultConfig, accessTokens;
 import zrenderer.server.routes : setErrorResponse, mergeStruct, unauthorized, logCustomRequest;
 import zrenderer.server.worker : renderWorker;
+import zrenderer.server.downloads : downloadManager;
 
 void handleRenderRequest(HTTPServerRequest req, HTTPServerResponse res) @trusted
 {
@@ -94,47 +95,52 @@ void handleRenderRequest(HTTPServerRequest req, HTTPServerResponse res) @trusted
         return;
     }
 
-    import std.file : read, FileException;
+    import std.file : read, FileException, write, exists;
+    import std.path : buildPath, baseName;
+    import std.exception : ifThrown;
+    import std.format : format;
+    import std.datetime.systime : Clock;
+    import std.conv : to;
+
+    // Verifica se foi solicitado download (zip dos arquivos)
+    bool downloadRequested = false;
+    try
+    {
+        downloadRequested = req.query.get("download", string.init).length > 0;
+    }
+    catch (Exception) {}
 
     if (mergedConfig.outputFormat == OutputFormat.zip)
     {
-
         if (response.output.length == 0)
         {
             setErrorResponse(res, HTTPStatus.noContent, "Nothing rendered");
             return;
         }
 
-        res.contentType("application/zip");
-        try
+        // Se download foi solicitado, cria link temporário
+        if (downloadRequested)
         {
-            res.writeBody(cast(ubyte[]) read(response.output[$-1]));
+            string zipFilepath = response.output[$-1];
+            
+            // Registra o arquivo zip no gerenciador de downloads
+            string downloadId = downloadManager.addDownload(zipFilepath);
+            
+            // Constrói o link de download
+            string host = req.headers.get("Host", "localhost");
+            string protocol = defaultConfig.enableSSL ? "https" : "http";
+            string downloadLink = format("%s://%s/download/%s", protocol, host, downloadId);
+            
+            response.downloadLink = downloadLink;
+            res.writeJsonBody(serializeToJson(response));
         }
-        catch (FileException err)
+        else
         {
-            logError(err.message);
-            setErrorResponse(res, HTTPStatus.internalServerError, "Error when writing response");
-            return;
-        }
-    }
-    else
-    {
-        import std.exception : ifThrown;
-
-        bool downloadImage = (req.query["downloadimage"].length >= 0).ifThrown(false);
-
-        if (downloadImage)
-        {
-            if (response.output.length == 0)
-            {
-                setErrorResponse(res, HTTPStatus.noContent, "Nothing rendered");
-                return;
-            }
-
-            res.contentType("image/png");
+            // Comportamento original: retorna o zip diretamente
+            res.contentType("application/zip");
             try
             {
-                res.writeBody(cast(ubyte[]) read(response.output[0]));
+                res.writeBody(cast(ubyte[]) read(response.output[$-1]));
             }
             catch (FileException err)
             {
@@ -143,9 +149,95 @@ void handleRenderRequest(HTTPServerRequest req, HTTPServerResponse res) @trusted
                 return;
             }
         }
+    }
+    else
+    {
+        // Para formato PNG, verifica se foi solicitado download (zip dos arquivos PNG)
+        if (downloadRequested)
+        {
+            if (response.output.length == 0)
+            {
+                setErrorResponse(res, HTTPStatus.noContent, "Nothing rendered");
+                return;
+            }
+
+            // Cria um zip com todos os arquivos PNG gerados
+            try
+            {
+                import std.zip : ArchiveMember, CompressionMethod;
+                
+                auto archive = new ZipArchive();
+                
+                foreach (filename; response.output)
+                {
+                    if (exists(filename))
+                    {
+                        auto member = new ArchiveMember();
+                        member.compressionMethod = CompressionMethod.none;
+                        member.name = baseName(filename);
+                        member.expandedData(cast(ubyte[]) read(filename));
+                        archive.addMember(member);
+                    }
+                }
+                
+                // Salva o zip temporário
+                import std.file : mkdirRecurse;
+                mkdirRecurse(mergedConfig.outdir);
+                
+                auto now = Clock.currTime();
+                string zipFilename = format("%s/download_%s.zip", 
+                    mergedConfig.outdir, 
+                    now.toUnixTime.to!string);
+                
+                write(zipFilename, archive.build());
+                
+                // Registra no gerenciador de downloads
+                string downloadId = downloadManager.addDownload(zipFilename);
+                
+                // Constrói o link de download
+                string host = req.headers.get("Host", "localhost");
+                string protocol = defaultConfig.enableSSL ? "https" : "http";
+                string downloadLink = format("%s://%s/download/%s", protocol, host, downloadId);
+                
+                response.downloadLink = downloadLink;
+                res.writeJsonBody(serializeToJson(response));
+            }
+            catch (Exception err)
+            {
+                logError("Error creating zip for download: %s", err.msg);
+                setErrorResponse(res, HTTPStatus.internalServerError, "Error creating download zip");
+                return;
+            }
+        }
         else
         {
-            res.writeJsonBody(serializeToJson(response));
+            // Comportamento original
+            bool downloadImage = (req.query["downloadimage"].length >= 0).ifThrown(false);
+
+            if (downloadImage)
+            {
+                if (response.output.length == 0)
+                {
+                    setErrorResponse(res, HTTPStatus.noContent, "Nothing rendered");
+                    return;
+                }
+
+                res.contentType("image/png");
+                try
+                {
+                    res.writeBody(cast(ubyte[]) read(response.output[0]));
+                }
+                catch (FileException err)
+                {
+                    logError(err.message);
+                    setErrorResponse(res, HTTPStatus.internalServerError, "Error when writing response");
+                    return;
+                }
+            }
+            else
+            {
+                res.writeJsonBody(serializeToJson(response));
+            }
         }
     }
 }

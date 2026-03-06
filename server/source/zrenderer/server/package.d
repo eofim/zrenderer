@@ -77,6 +77,9 @@ int main(string[] args)
         router.any("*", &addCORSOriginHeader);
     }
     router.post("/render", &handleRenderRequest);
+    router.get("/download/:id", &handleDownloadRequest);
+    router.get("/item/icon/:id", &handleItemIcon);
+    router.get("/collection/:name", &handleCollectionIcon);
     router.get("/token/info", &getAccessTokenInfo);
     router.get("/admin/tokens", &getAccessTokens);
     router.post("/admin/tokens", &newAccessToken);
@@ -87,6 +90,9 @@ int main(string[] args)
     if (defaultConfig.enableCORS)
     {
         router.corsOptionsRoute!("/render", "POST");
+        router.corsOptionsRoute!("/download/:id", "GET");
+        router.corsOptionsRoute!("/item/icon/:id", "GET");
+        router.corsOptionsRoute!("/collection/:name", "GET");
         router.corsOptionsRoute!("/token/info", "GET");
         router.corsOptionsRoute!("/admin/tokens", "GET, POST");
         router.corsOptionsRoute!("/admin/tokens/:id", "POST, DELETE");
