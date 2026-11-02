@@ -2,6 +2,7 @@ module app;
 
 import config : Config, Gender, HeadDirection, OutputFormat, MadogearType, NoJobId;
 import draw : Canvas, canvasFromString;
+import hateffect : HatEffects;
 import logging : LogLevel, LogDg;
 import luad.state : LuaState;
 import resolver;
@@ -246,14 +247,56 @@ string[] process(immutable Config config, LogDg log, LuaState L,
                 makeIndex!"a.zIndex < b.zIndex"(sprites, index);
             }
 
-            RawImage[] images = drawPlayer(sprites, config.action,
-                    (requestFrame < 0) ? uint.max : requestFrame, &sortIndexDelegate, canvas);
+            const uint drawFrame = (requestFrame < 0) ? uint.max : requestFrame;
 
-            if (isBaby(jobid))
+            import hateffect : loadHatEffects, createTimeline, composeFrames;
+
+            HatEffects hatEffects;
+
+            if (config.hateffect.length > 0)
+            {
+                hatEffects = loadHatEffects(config.hateffect, jobid, L, resManager, log);
+            }
+
+            const bool drawHatEffects = hatEffects.layers.length > 0;
+
+            immutable(Canvas) renderCanvas = (drawHatEffects && canvas == Canvas.init)
+                ? canvasIncludingEffects(sprites, config.action, drawFrame, hatEffects)
+                : canvas;
+
+            RawImage[] images = drawPlayer(sprites, config.action, drawFrame, &sortIndexDelegate, renderCanvas);
+
+            if (hatEffects.tintsCharacter)
+            {
+                import hateffect : applyColor;
+
+                // Like the client's body color: only the character is tinted, not the effects
+                images.applyColor(hatEffects.color);
+            }
+
+            ushort animationDelayMs = 0;
+
+            if (drawHatEffects && renderCanvas != Canvas.init)
+            {
+                // Effects stay animated when all frames were requested, even if the body only has a
+                // single frame (e.g. --headdir=straight for the stand and sit actions)
+                const single = config.frame >= 0;
+                const timeline = createTimeline(images.length, animationInterval * 25, hatEffects.layers);
+
+                images = composeFrames(images, hatEffects.layers, renderCanvas, timeline, single);
+
+                if (!single)
+                {
+                    animationDelayMs = timeline.delayMs;
+                }
+            }
+
+            const scale = (isBaby(jobid) ? 0.75f : 1f) * hatEffects.scale;
+
             {
                 import renderer : applyBabyScaling;
 
-                images.applyBabyScaling(0.75);
+                images.applyBabyScaling(scale);
             }
 
 
@@ -262,7 +305,7 @@ string[] process(immutable Config config, LogDg log, LuaState L,
                 import filehelper : storeImages;
 
                 auto fnames = storeImages(images, requestFrame, config, outputFilename, zipFilename, log,
-                        animationInterval, archive);
+                        animationInterval, archive, animationDelayMs);
 
                 if (config.outputFormat != OutputFormat.zip)
                 {
@@ -508,20 +551,22 @@ Sprite[] processPlayer(uint jobid, LogDg log, immutable Config config, Resolver 
 
     sprites ~= bodysprite;
 
-    const headspritepath = resolve.playerHeadSprite(jobid, config.head, config.gender);
     Sprite headsprite;
-
-    try
+    const headspritepath = resolve.playerHeadSprite(jobid, config.head, config.gender);
+    if (headspritepath.length > 0)
     {
-        log(LogLevel.trace, "Loading Head " ~ headspritepath);
-        headsprite = resManager.getSprite(headspritepath, SpriteType.playerhead);
-        headsprite.parent(bodysprite);
-        headsprite.headdir = config.headdir;
-        sprites ~= headsprite;
-    }
-    catch (ResourceException err)
-    {
-        log(LogLevel.warning, err.msg);
+        try
+        {
+            log(LogLevel.trace, "Loading Head " ~ headspritepath);
+            headsprite = resManager.getSprite(headspritepath, SpriteType.playerhead);
+            headsprite.parent(bodysprite);
+            headsprite.headdir = config.headdir;
+            sprites ~= headsprite;
+        }
+        catch (ResourceException err)
+        {
+            log(LogLevel.warning, err.msg);
+        }
     }
 
     if ((config.weapon > 0 || resolver.isMadogear(jobid)) && jobid != NoJobId)
@@ -577,7 +622,7 @@ Sprite[] processPlayer(uint jobid, LogDg log, immutable Config config, Resolver 
         }
     }
 
-    if (config.headgear.length > 0)
+    if (config.headgear.length > 0 && headsprite !is null)
     {
         import std.algorithm : min;
 
@@ -700,7 +745,7 @@ Sprite[] processPlayer(uint jobid, LogDg log, immutable Config config, Resolver 
         }
     }
 
-    if (config.headPalette > -1)
+    if (config.headPalette > -1 && headsprite !is null)
     {
         auto headpalettepath = resolve.headPalette(jobid, config.head, config.headPalette, config.gender);
         if (headpalettepath.length > 0)
@@ -734,7 +779,7 @@ Sprite[] processPlayer(uint jobid, LogDg log, immutable Config config, Resolver 
                 bodysprite.loadImagesOfAction(config.action,
                         bodypalette !is null && bodypalette.usable ? bodypalette.palette : Palette.init);
             }
-            else if (sprite.type == SpriteType.playerhead)
+            else if (headsprite !is null && sprite.type == SpriteType.playerhead)
             {
                 headsprite.loadImagesOfAction(config.action,
                         headpalette !is null && headpalette.usable ? headpalette.palette : Palette.init);
@@ -754,7 +799,7 @@ Sprite[] processPlayer(uint jobid, LogDg log, immutable Config config, Resolver 
                 bodysprite.loadImagesOfFrame(config.action, requestFrame,
                         bodypalette !is null && bodypalette.usable ? bodypalette.palette : Palette.init);
             }
-            else if (sprite.type == SpriteType.playerhead)
+            else if (headsprite !is null && sprite.type == SpriteType.playerhead)
             {
                 headsprite.loadImagesOfFrame(config.action, requestFrame,
                         headpalette !is null && headpalette.usable ? headpalette.palette : Palette.init);
@@ -772,6 +817,29 @@ Sprite[] processPlayer(uint jobid, LogDg log, immutable Config config, Resolver 
     }
 
     return sprites;
+}
+
+/// Canvas that fits the character as well as all hat effects
+private immutable(Canvas) canvasIncludingEffects(Sprite[] sprites, uint action, uint frame,
+        HatEffects hatEffects)
+{
+    import hateffect : effectBounds;
+    import renderer : playerBoundingBox;
+
+    auto box = playerBoundingBox(sprites, action, frame);
+    const effectBox = effectBounds(hatEffects.layers);
+
+    if (!effectBox.isInfinite)
+    {
+        box.updateBounds(effectBox);
+    }
+
+    if (box.isInfinite || box.width == 0 || box.height == 0)
+    {
+        return Canvas.init;
+    }
+
+    return immutable(Canvas)(box.width, box.height, -box.x1, -box.y1);
 }
 
 bool shouldDrawShadow(bool enableShadow, uint jobid, uint action) pure nothrow @safe @nogc
